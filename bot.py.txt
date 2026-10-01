@@ -17,8 +17,8 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+ADMIN_CHAT_ID = int(os.getenv("-1004308348205", "0"))
+CHANNEL_ID = os.getenv("@bduconfession00")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "300"))
 
 # Configure logging
