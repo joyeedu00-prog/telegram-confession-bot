@@ -1,0 +1,186 @@
+import os
+import sqlite3
+import time
+import logging
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+# Load variables from .env file
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "300"))
+
+# Configure logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+
+# Memory cache for user cooldown timestamps {user_id: last_timestamp}
+user_last_submission = {}
+
+# ── Database Setup ────────────────────────────────────────────────────────────
+
+def init_db():
+    """Creates the SQLite table to track confession index permanently."""
+    conn = sqlite3.connect("confessions.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value INTEGER
+        )
+    """)
+    # Insert counter start value if not present
+    cursor.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('counter', 1)")
+    conn.commit()
+    conn.close()
+
+def get_next_confession_id() -> int:
+    """Safely increments and returns the next confession number."""
+    conn = sqlite3.connect("confessions.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM meta WHERE key = 'counter'")
+    current_val = cursor.fetchone()[0]
+    next_val = current_val + 1
+    cursor.execute("UPDATE meta SET value = ? WHERE key = 'counter'", (next_val,))
+    conn.commit()
+    conn.close()
+    return current_val
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Greets the user and gives clear submission instructions."""
+    welcome_text = (
+        "👋 **Welcome to the Confession Bot!**\n\n"
+        "Send your message directly to this chat. Your identity will **never** be revealed.\n\n"
+        "• Your confession will be sent to the review team.\n"
+        "• Once approved, it will be posted to the public channel."
+    )
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+async def receive_confession(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processes incoming user confessions with rate-limiting."""
+    if update.effective_chat.type != "private":
+        return
+
+    user_id = update.effective_user.id
+    current_time = time.time()
+
+    # Check cooldown
+    if user_id in user_last_submission:
+        elapsed = current_time - user_last_submission[user_id]
+        if elapsed < COOLDOWN_SECONDS:
+            remaining = int(COOLDOWN_SECONDS - elapsed)
+            minutes, seconds = divmod(remaining, 60)
+            await update.message.reply_text(
+                f"⏳ Please wait {minutes}m {seconds}s before submitting another confession."
+            )
+            return
+
+    text = update.message.text
+    if not text:
+        await update.message.reply_text("⚠️ Please send only text confessions.")
+        return
+
+    # Prepare Admin Review UI
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Approve", callback_data="approve"),
+            InlineKeyboardButton("❌ Reject", callback_data="reject"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    admin_payload = (
+        "📬 *Pending Confession:*\n\n"
+        f"{text}"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=admin_payload,
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+        # Update cooldown timestamp on successful dispatch
+        user_last_submission[user_id] = current_time
+        await update.message.reply_text("✅ Confession received! It has been submitted to moderators.")
+    except Exception as e:
+        logging.error(f"Error forwarding confession: {e}")
+        await update.message.reply_text("❌ Failed to forward submission. Please try again later.")
+
+async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Executes moderator actions: Approve or Reject."""
+    query = update.callback_query
+    await query.answer()
+
+    action = query.data
+    raw_text = query.message.text
+
+    # Extract original text (ignoring the review header)
+    prefix = "📬 Pending Confession:\n\n"
+    confession_body = raw_text[len(prefix):] if raw_text.startswith(prefix) else raw_text
+
+    if action == "approve":
+        confession_id = get_next_confession_id()
+        channel_post = (
+            f"🗣 *#Confession_{confession_id}*\n\n"
+            f"{confession_body}"
+        )
+
+        try:
+            # Post directly to the public channel
+            await context.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=channel_post,
+                parse_mode="Markdown"
+            )
+
+            # Update review message in admin group to prevent double-clicks
+            await query.edit_message_text(
+                f"✅ *Approved as #{confession_id}*\n\n{confession_body}",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Posting error: {e}")
+            await query.message.reply_text(f"⚠️ Error posting to channel: {e}")
+
+    elif action == "reject":
+        await query.edit_message_text(
+            f"❌ *Rejected*\n\n{confession_body}",
+            parse_mode="Markdown"
+        )
+
+# ── Application Bootstrap ─────────────────────────────────────────────────────
+
+def main():
+    if not BOT_TOKEN or not ADMIN_CHAT_ID or not CHANNEL_ID:
+        raise ValueError("Missing critical configuration in .env file.")
+
+    init_db()
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_confession))
+    app.add_handler(CallbackQueryHandler(handle_decision))
+
+    print("Bot is listening for messages...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
